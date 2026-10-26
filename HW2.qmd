@@ -1,0 +1,438 @@
+---
+title: "Exploring Patterns of Environmental Justice"
+subtitle: "The legacy of redlining in Los Angeles County"
+author: "Ashwin Chockkalingam"
+date: 2026-10-24
+format:
+  pdf:
+    code-fold: false
+    fig-width: 8
+    fig-height: 6
+execute:
+  warning: true
+  message: false
+---
+
+# Summary
+
+In this assignment I explored the legacy of redlining in Los Angeles County and analyzed whether there was correlation between HOLC redlining grades and adverse environmental, socioeconomic, and safety outcomes.
+
+## Setup
+
+```{r}
+#| label: setup
+
+# Load in libraries
+library(sf)       # for vector data
+library(stars)    # for raster data
+library(tmap)     # for static and interactive maps
+library(here)
+library(tidyverse)
+library(gt)       # for formatted tables
+
+# Global option setting
+options(tibble.width = Inf)
+```
+
+## Data import
+
+Three datasets were used in this analysis. EJScreen from the EPA for block groups and information on environmental and socioeconomic outcomes. HOLC data from the University of Richmond, and Bike and Pedestrian Crash Reports from the Statewide Integrated Traffic Records System aka SWITRS.
+
+```{r}
+#| label: data-import
+
+# Load in the data
+## Read in HOLC Redlining json.
+holc <- st_read(here("data", "mapping-inequality",
+                     "mapping-inequality-los-angeles.json"))
+
+## Read in EJ Screen gdb.
+ejscreen <- st_read(here("data", "ejscreen",
+                         "EJSCREEN_2023_BG_StatePct_with_AS_CNMI_GU_VI.gdb"))
+
+## Read in Bike/Pedestrian Crashes
+crashes <- read_csv(here("data", "SWITRS_LA", "Crashes.csv"))
+```
+
+## Coordinate reference systems
+
+CRSs need to match before we can do any spatial operations. HOLC is EPSG:4326 (geographic, degrees); EJScreen is EPSG:3857 (projected, meters). HOLC was standardized to EJScreen's CRS EPSG:3857.
+
+```{r}
+#| label: crs-inspect
+
+# Check CRS of each dataset
+st_crs(holc)
+st_crs(ejscreen)
+
+# crs is not the same, so one has to be transformed before any spatial operation
+if (st_crs(holc) != st_crs(ejscreen)) {
+  warning("HOLC and EJScreen CRSs do not match. Transforming HOLC to match EJScreen below.")
+}
+```
+
+---
+
+# Part 1: Legacy of redlining in current environmental (in)justice
+
+## Preparing the data
+
+We need to restrict EJScreen to Los Angeles County. LA County was used rather than city because the HOLC data extend past the City of Los Angeles so a city filter would discard HOLC neighborhoods the analysis is meant to cover.
+
+```{r}
+#| label: filter-la
+
+# check how many rows or block groups LA County has, as a check on the filter below
+expected_la_rows <- sum(ejscreen$CNTY_NAME == "Los Angeles County", na.rm = TRUE)
+expected_la_rows
+
+# filter ejscreen for LA County and create new dataframe
+ejscreen_la <- ejscreen |>
+  filter(CNTY_NAME == "Los Angeles County")
+
+nrow(ejscreen_la)
+```
+
+```{r}
+#| label: transform-crs
+
+# transform crs to be the same for both datasets
+holc_transform <- st_transform(holc, crs = st_crs(ejscreen_la))
+
+# a mismatch here would silently corrupt every spatial operation downstream
+if (st_crs(holc_transform) != st_crs(ejscreen_la)) {
+  stop("CRS mismatch persists after transform. Do not proceed to the spatial join.")
+}
+
+st_crs(holc_transform) == st_crs(ejscreen_la)
+```
+
+```{r}
+#| label: holc-na-grade
+
+# check for NA values in grade
+n_ungraded <- sum(is.na(holc_transform$grade))
+n_ungraded
+
+# 1 na value, so i will drop it. this also means NA grade after the join
+# unambiguously means "outside the HOLC footprint"
+holc_transform <- holc_transform %>%
+  drop_na(grade)
+
+# Confirm only the expected four grades remain
+if (!setequal(unique(holc_transform$grade), c("A", "B", "C", "D"))) {
+  stop("Unexpected grade values remain after dropping NAs.")
+}
+```
+
+## Task 1: Map of historical redlining neighborhoods
+
+The colors below match the palette used on the original 1939 HOLC residential security maps. Block groups are drawn underneath as a context layer/basemap so the reader can locate the HOLC neighborhoods within the county, and the extent is bounded to the HOLC footprint rather than the full county.
+
+```{r}
+#| label: fig-holc-map
+#| fig-cap: "HOLC residential security grades, Los Angeles County"
+
+# creating map for part 1
+tm_shape(ejscreen_la, bbox = holc_transform) +
+  tm_borders() +
+tm_shape(holc_transform) +
+  tm_fill(
+    fill = "grade",
+    fill.scale = tm_scale_categorical(
+      values = c('#76A865', '#7B9BB0', '#CDB44C', '#BC5F72'),
+      labels = c('A (First Grade - Best)',
+                 'B (Second Grade - Still Desirable)',
+                 'C (Third Grade - Definitely Declining)',
+                 'D (Fourth Grade - Hazardous)')
+    ),
+    fill.legend = tm_legend(title = 'HOLC Grade', position = tm_pos_out("right"))
+  ) +
+  tm_title('Historical Redlining Neighborhoods in Los Angeles County') +
+  tm_scalebar() +
+  tm_compass()
+```
+
+## Task 2: Block groups by HOLC grade
+
+```{r}
+#| label: spatial-join
+
+# Record the pre-join count so duplication can be detected
+n_block_groups <- nrow(ejscreen_la)
+
+# Join datasets. largest = TRUE assigns each block group the grade of the HOLC
+# polygon it overlaps most which prevents one block group generating multiple
+# rows when it straddles a HOLC boundary.
+ej_holc_comb <- st_join(ejscreen_la, holc_transform, largest = TRUE)
+
+# A duplicated ID would double-count a block group in every percentage below
+if (any(duplicated(ej_holc_comb$ID))) {
+  stop("Duplicate block group IDs found after the join.")
+}
+
+# drop geometry, no longer needed for the summary statistics
+ej_holc_comb_df <- st_drop_geometry(ej_holc_comb)
+
+nrow(ej_holc_comb_df)
+```
+
+The denominator below is all 6,591 LA County block groups. The "No HOLC Grade" row combines areas developed after 1939, and unsurveyed gaps inside the basin. 
+
+```{r}
+#| label: tbl-grade-summary
+
+# create table. count() retains NA as its own category
+table_data <- ej_holc_comb_df %>%
+  count(grade) %>%
+  mutate(percentage = (n / sum(n)) * 100)
+
+# Counts must reconcile to the full set of LA County block groups
+if (sum(table_data$n) != n_block_groups) {
+  stop("Grade counts do not sum to the total number of block groups.")
+}
+
+# outputting table
+table_data %>%
+  gt() %>%
+  tab_header(
+    title = "Percentage of census block groups that fall within a HOLC Grade or not.",
+    subtitle = "Los Angeles County block groups, n = 6,591"
+  ) %>%
+  cols_label(
+    grade = "HOLC Grade",
+    n = "Count of Block Groups",
+    percentage = "Percentage"
+  ) %>%
+  sub_missing(columns = grade, missing_text = "No HOLC Grade") %>%
+  fmt_number(columns = percentage, decimals = 2)
+```
+
+## Task 3: Present-day conditions within HOLC grades
+
+The three variables are split across two figures because they are measured on different scales. The two percentile measures share a 0 to 100 scale and can sit on one axis, while % low income is a percentage of households and needs its own. Ungraded block groups are excluded from both so that the comparison is only for the grades (A-D).
+
+```{r}
+#| label: fig-percentiles
+#| fig-cap: "Mean environmental and health percentiles by HOLC grade"
+
+# create summary df for percentile chart; ungraded block groups excluded
+percen_chart <- ej_holc_comb_df %>%
+  filter(!is.na(grade)) %>%
+  group_by(grade) %>%
+  summarize(
+    avg_particulate = mean(P_PM25, na.rm = TRUE),
+    avg_life_exp    = mean(P_LIFEEXPPCT, na.rm = TRUE)
+  )
+
+# pivot data to long format so that measure can be mapped to fill
+percen_chart_long <- percen_chart %>%
+  pivot_longer(
+    cols = c(avg_particulate, avg_life_exp),
+    names_to = 'Variable',
+    values_to = 'Value'
+  )
+
+# create graph
+percen_chart_long %>%
+  ggplot(aes(x = grade, y = Value, fill = Variable)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = 'Average percentile for low life expectancy and average \npercentile for particulate matter (2.5) in each \nHOLC Grade',
+    x = 'HOLC Grade',
+    y = 'Average Percentile',
+    fill = 'Measure'
+  ) +
+  scale_fill_discrete(
+    labels = c(avg_life_exp = "Average Low Life Expectancy",
+               avg_particulate = "Average Particulate Matter (2.5)")
+  )
+```
+
+```{r}
+#| label: fig-low-income
+#| fig-cap: "Mean percentage of low-income households by HOLC grade"
+
+# low income pct plot. LOWINCPCT is stored as a proportion, so multiply by 100
+# to express as a percentage
+low_income_plt <- ej_holc_comb_df %>%
+  filter(!is.na(grade)) %>%
+  group_by(grade) %>%
+  summarize(avg_low_income = 100 * mean(LOWINCPCT, na.rm = TRUE))
+
+# create graph
+low_income_plt %>%
+  ggplot(aes(x = grade, y = avg_low_income)) +
+  geom_col(fill = 'darkred', color = 'darkred') +
+  labs(
+    title = 'Average Percentage of Low-income Households in \nEach HOLC Grade',
+    x = 'HOLC Grade',
+    y = 'Average Percentage'
+  )
+```
+
+## Task 4: Reflection
+
+All three of the metrics we analyzed (air quality, share of low income, and share of low life expectancy) worsened from grade A (best) to D (worst). The two percentile metrics are different in terms of their steepness with the low life expectancy gradient covering the 24th to 54th percentile whereas the PM2.5 gradient is from the 72nd to 80th (which suggests that air quality is a regional burden across LA whereas poverty and health outcomes correlate with grade more closely) These areas were also different prior to HOLC so it's not necessarily the sole factor in the cause of the disparities but it definitely played a part. HOLC helped in formalising and entrenching the disparities that were already there.
+
+---
+
+# Part 2: Legacy of redlining in pedestrian and bike accidents
+
+## Preparing the crash data
+
+SWITRS codes crash types as flag columns taking "Y" or blank, so an NA means the crash was not of that type rather than that data is missing. The filter below keeps crashes flagged as either pedestrian or bicycle.
+
+```{r}
+#| label: filter-crashes
+
+# filtering for bike and pedestrian incidents
+nrow(crashes)
+
+# SWITRS flags crash types as "Y" or blank, so NA means "not this type"
+bike_ped_crash <- crashes %>%
+  filter(PEDESTRIAN_ACCIDENT == "Y" | BICYCLE_ACCIDENT == "Y")
+
+if (nrow(bike_ped_crash) == 0) {
+  stop("No bike or pedestrian crashes matched. Check the flag column coding.")
+}
+
+nrow(bike_ped_crash)
+```
+
+The codebook documents POINT_X/POINT_Y as WGS84 coordinates geocoded by SafeTREC, while LATITUDE/LONGITUDE come straight from the crash report with no stated CRS. POINT_X/POINT_Y are also far more complete, as the counts below show.
+
+```{r}
+#| label: coordinate-comparison
+
+# count NAs for two types of location information
+n_na_point <- sum(is.na(bike_ped_crash$POINT_X))
+n_na_latlon <- sum(is.na(bike_ped_crash$LATITUDE))
+
+n_na_point
+sum(is.na(bike_ped_crash$POINT_Y))
+sum(is.na(bike_ped_crash$LONGITUDE))
+n_na_latlon
+```
+
+Checking the bounding box after conversion revealed records sitting at exactly (0, 0), meaning some rows use 0 as a missing-coordinate placeholder rather than NA, plus a small number of geocodes falling outside the county. Filtering spatially to LA County removes both.
+
+```{r}
+#| label: crashes-to-sf
+
+# going to use point x/y because long/lat is missing way more.
+# filter out na values in points, then declare the CRS the coordinates are
+# already in (WGS84 per codebook) and transform to match the other datasets
+bike_ped_crash_sf <- bike_ped_crash %>%
+  filter(!is.na(POINT_X)) %>%
+  st_as_sf(coords = c("POINT_X", "POINT_Y"), crs = 4326) %>%
+  st_transform(crs = st_crs(holc_transform))
+
+# Verify the conversion landed in Los Angeles rather than somewhere else
+st_bbox(bike_ped_crash_sf)
+
+if (st_crs(bike_ped_crash_sf) != st_crs(holc_transform)) {
+  stop("Crash CRS does not match HOLC after transform.")
+}
+
+n_before_filter <- nrow(bike_ped_crash_sf)
+
+# Restrict to crashes falling inside LA County. Removing records that used
+# 0 as a missing-coordinate placeholder.
+bike_ped_crash_sf <- bike_ped_crash_sf %>%
+  st_filter(ejscreen_la)
+
+n_dropped_spatial <- n_before_filter - nrow(bike_ped_crash_sf)
+
+if (n_dropped_spatial > 0) {
+  warning(paste("Dropped", n_dropped_spatial,
+                "crash records falling outside Los Angeles County",
+                "(placeholder (0,0) coordinates and erroneous geocodes)"))
+}
+
+# Confirming the extent is now in LA County
+st_bbox(bike_ped_crash_sf)
+nrow(bike_ped_crash_sf)
+```
+
+## Joining crashes to HOLC grades
+
+Roughly 52% of crashes fall outside the HOLC data. The figure below reports each measure as a share of crashes only within graded areas. 
+
+```{r}
+#| label: crash-holc-join
+
+n_crashes <- nrow(bike_ped_crash_sf)
+
+# spatial join. Points fall within a single polygon, so the default is sufficient
+crash_holc <- st_join(bike_ped_crash_sf, holc_transform)
+
+# Crashes outside the HOLC footprint, excluded from the figure below
+n_ungraded_crashes <- sum(is.na(crash_holc$grade))
+n_ungraded_crashes
+
+# drop geometry
+crash_holc_df <- st_drop_geometry(crash_holc)
+```
+
+```{r}
+#| label: fig-crashes
+#| fig-cap: "Distribution of bike and pedestrian crashes and fatalities across HOLC grades"
+
+# Count crashes and sum fatalities within each grade. The two fatality columns
+# are summed separately so that an NA in one does not discard the other.
+crash_summary <- crash_holc_df %>%
+  filter(!is.na(grade)) %>%
+  group_by(grade) %>%
+  summarise(
+    crashes = n(),
+    fatalities = sum(COUNT_PED_KILLED, na.rm = TRUE) +
+                 sum(COUNT_BICYCLIST_KILLED, na.rm = TRUE)
+  ) %>%
+  mutate(
+    pct_crashes    = crashes / sum(crashes) * 100,
+    pct_fatalities = fatalities / sum(fatalities) * 100
+  )
+
+# Fatalities cannot exceed crashes within any grade
+if (any(crash_summary$fatalities > crash_summary$crashes)) {
+  stop("Fatality count exceeds crash count in at least one grade.")
+}
+
+crash_summary
+
+# pivot to long format so that measure can be mapped to fill
+crash_summary_long <- crash_summary %>%
+  select(grade, pct_crashes, pct_fatalities) %>%
+  pivot_longer(
+    cols = c(pct_crashes, pct_fatalities),
+    names_to = 'Measure',
+    values_to = 'Percentage'
+  )
+
+# create graph
+crash_summary_long %>%
+  ggplot(aes(x = grade, y = Percentage, fill = Measure)) +
+  geom_col(position = "dodge") +
+  labs(
+    title = 'Distribution of bike and pedestrian crashes and fatalities \nacross HOLC grades, Los Angeles County 2020-2025',
+    subtitle = 'Each measure shown as a share of its own total within HOLC-graded areas',
+    x = 'HOLC Grade',
+    y = 'Percentage (%)',
+    fill = 'Measure'
+  ) +
+  scale_fill_discrete(
+    labels = c(pct_crashes = "Crashes", pct_fatalities = "Fatalities")
+  )
+```
+
+The two distributions are very similar. With this data we cant say with confidence that a crash involving a bike or pedestrian in a C or D area is more likely to be fatal than one in any other area, it's just that there are more records of them possibly due to there being more people.
+---
+
+# Data sources
+
+**EJScreen.** United States Environmental Protection Agency. *EJScreen: Environmental Justice Screening and Mapping Tool*, 2023 release, block group level with state percentiles. The tool has since been decommissioned; data downloaded from <https://www.epa.gov/ejscreen/download-ejscreen-data>.
+
+**HOLC redlining grades.** Robert K. Nelson, LaDale Winling, Richard Marciano, Nathan Connolly, et al. "Mapping Inequality: Redlining in New Deal America." *American Panorama*, ed. Robert K. Nelson and Edward L. Ayers. Digital Scholarship Lab, University of Richmond. <https://dsl.richmond.edu/panorama/redlining/>
+
+**Crash records.** California Highway Patrol. *Statewide Integrated Traffic Records System (SWITRS)*, 2020-2025. Accessed via the Transportation Injury Mapping System (TIMS), Safe Transportation Research and Education Center, University of California, Berkeley. <https://tims.berkeley.edu/>
